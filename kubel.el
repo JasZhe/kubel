@@ -78,7 +78,7 @@
 ;; p => port forward pod
 ;; l => log popup
 ;; e => exec popup
-;; j => jab deployment to force rolling update
+;; j => restart deployment
 ;; S => scale replicas
 ;; C => set context
 ;; n => set namespace
@@ -1442,19 +1442,18 @@ the variables `kubel-namespace' and `kubel-context', respectively."
                 (when force '("--force" "--grace-period=0")))))
      (or kubel--selected-items (list (tabulated-list-get-id))))))
 
-(defun kubel-jab-deployment ()
-  "Patch the selected deployments to trigger a rolling update."
+(defun kubel-restart-deployment ()
+  "Restart selected deployments using `kubectl rollout restart'."
   (interactive)
   (kubel--map-resources
    (lambda (deployment)
-     (kubel--exec-async
-      (format "kubel - bouncing - %s" deployment)
-      (list "patch" "deployment" deployment "-p"
-            (format "{\"spec\":{\"template\":{\"metadata\":{\"labels\":{\"date\":\"%s\"}}}}}"
-                    (round (time-to-seconds))))))
+     (kubel--exec-async (format "kubel - restart - %s" deployment)
+                        (list "rollout" "restart" (concat "deployment/" deployment))))
    (if (kubel--is-deployment-view)
        (or kubel--selected-items (list (tabulated-list-get-id)))
      (list (kubel--select-resource "Deployments")))))
+
+(defalias 'kubel-jab-deployment #'kubel-restart-deployment)
 
 (defun kubel-scale-replicas (replicas)
   "Scale resource replicas.
@@ -1657,7 +1656,7 @@ When called interactively, prompts for a buffer belonging to kubel."
     ("p" "Port forward" kubel-port-forward-pod)
     ("l" "Logs" kubel-log-popup)
     ("e" "Exec" kubel-exec-popup)
-    ("j" "Jab" kubel-jab-deployment)
+    ("j" "Restart deployment" kubel-restart-deployment)
     ("S" "Scale replicas" kubel-scale-replicas)]
    ["Settings"
     ("C" "Set context" kubel-set-context)
@@ -1712,7 +1711,7 @@ When called interactively, prompts for a buffer belonging to kubel."
     (define-key map (kbd "c") 'kubel-copy-popup)
     (define-key map (kbd "e") 'kubel-exec-popup)
     (define-key map (kbd "!") 'kubel-exec-pod-by-shell-command)
-    (define-key map (kbd "j") 'kubel-jab-deployment)
+    (define-key map (kbd "j") 'kubel-restart-deployment)
 
     (define-key map (kbd "m") 'kubel-mark-item)
     (define-key map (kbd "u") 'kubel-unmark-item)

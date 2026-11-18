@@ -49,7 +49,7 @@
 ;; l => log popup
 ;; c => copy popup
 ;; d => delete pod
-;; a => jab deployment to force rolling update
+;; a => restart deployment
 ;; S => scale replicas
 ;;
 
@@ -88,7 +88,7 @@
     ("p" "Port forward" kubel-port-forward-pod)
     ("l" "Logs" kubel-log-popup)
     ("e" "Exec" kubel-exec-popup)
-    ("a" "Jab" kubel-jab-deployment) ;; can't use j here
+    ("a" "Restart deployment" kubel-restart-deployment) ;; can't use j here
     ("S" "Scale replicas" kubel-scale-replicas)]
    ["Settings"
     ("C" "Set context" kubel-set-context)
@@ -134,7 +134,7 @@
   (kbd "l") #'kubel-log-popup
   (kbd "c") #'kubel-copy-popup
   (kbd "e") #'kubel-exec-popup
-  (kbd "a") #'kubel-jab-deployment
+  (kbd "a") #'kubel-restart-deployment
   (kbd "S") #'kubel-scale-replicas
   (kbd "u") #'kubel-unmark-item
   (kbd "M") #'kubel-mark-all

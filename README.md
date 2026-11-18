@@ -131,7 +131,7 @@ r => see the rollout history for resource
 p => port forward pod
 l => log popup
 e => exec popup
-j => jab deployment to force rolling update
+j => restart deployment using kubectl rollout restart
 S => scale resource replicas
 C => set context
 n => set namespace
@@ -157,6 +157,12 @@ After describing a resource in YAML format, you can edit the buffer and hit `C-c
 For example, if you want to edit a deployment, you can switch the resource with `R` and select "Deployments", then press return with the cursor on the row you wish to edit, edit the buffer, and hit `C-c C-c` to apply.
 
 Alternatively, you can hit `E` to then select the resource type and the resource name of what you want to edit.
+
+The `j` action uses `kubectl rollout restart deployment/NAME` to restart the
+selected deployments. The previous `kubel-jab-deployment` function remains an
+alias for `kubel-restart-deployment`. There is no need to inject a dummy environment
+variable or label to initiate a restart. Completion of the command means the
+restart was requested; use automatic refresh to follow pod progress.
 
 ## Customize
 

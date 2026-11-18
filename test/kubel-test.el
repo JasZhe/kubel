@@ -249,6 +249,35 @@ does not accept `--selector' at all."
     (kubel--get-list-entries '(("NAMESPACE" "NAME") ("beta" "same")))
     (should (equal kubel--selected-items '(("beta" . "same"))))))
 
+(ert-deftest kubel--test-batch-delete-and-restart-namespace-scoping ()
+  "Every marked resource uses its own namespace despite output buffer switches."
+  (with-temp-buffer
+    (kubel-mode)
+    (setq kubel-context "ctx" kubel-namespace "default"
+          kubel-all-namespaces t kubel-resource "deployments"
+          kubel--selected-items '(("alpha" . "same") ("beta" . "same")))
+    (let ((origin (current-buffer)) commands
+          (output (generate-new-buffer " *kubel-test-batch-output*")))
+      (unwind-protect
+          (cl-letf (((symbol-function 'transient-args) (lambda (_) nil))
+                    ((symbol-function 'kubel--exec-async)
+                     (lambda (_name args &rest _)
+                       (push (append (kubel--get-context-namespace) args) commands)
+                       (set-buffer output))))
+            (kubel-delete-resource)
+            (should (equal (nreverse commands)
+                           '(("--context" "ctx" "-n" "alpha" "delete" "deployments" "same")
+                             ("--context" "ctx" "-n" "beta" "delete" "deployments" "same"))))
+            (setq commands nil)
+            (set-buffer origin)
+            (kubel-restart-deployment)
+            (should (equal (nreverse commands)
+                           '(("--context" "ctx" "-n" "alpha" "rollout" "restart" "deployment/same")
+                             ("--context" "ctx" "-n" "beta" "rollout" "restart" "deployment/same"))))
+            (should (eq (indirect-function 'kubel-jab-deployment)
+                        (symbol-function 'kubel-restart-deployment))))
+        (kill-buffer output)))))
+
 (ert-deftest kubel--test-auto-refresh-delay-starts-after-completion ()
   "Enabling during a slow request waits until completion before starting a delay."
   (with-temp-buffer
