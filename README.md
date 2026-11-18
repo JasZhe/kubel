@@ -72,6 +72,13 @@ this indicates completion of the request, not readiness of the resulting pods.
 Customize `kubel-spinner-frames` to change the animation (for example,
 `["|" "/" "-" "\\"]` for ASCII).
 
+Press `C-c C-r` (or run `M-x kubel-auto-refresh-mode`) to toggle automatic refresh
+for the current resource buffer. Each completed async refresh schedules the next
+one after `kubel-auto-refresh-interval` seconds (default: 1). If the initial
+request is still running, the delay begins when it finishes. Requests never
+overlap, hidden buffers pause polling, and closing a buffer stops its timer.
+This polls resource lists rather than opening a Kubernetes watch stream.
+
 To set said namespace and context, respectively call
 ```
 M-x kubel-set-namespace
@@ -110,6 +117,7 @@ h => help popup
 ! => quick run shell-command
 E => quick edit any resource
 g => refresh
+C-c C-r => toggle automatic refresh
 k => delete popup
 r => see the rollout history for resource
 p => port forward pod

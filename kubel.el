@@ -71,6 +71,7 @@
 ;; ? => help popup
 ;; E => quick edit any resource
 ;; g => refresh
+;; C-c C-r => toggle automatic refresh
 ;; k => delete popup
 ;; r => see the rollout history for resource
 ;; p => port forward pod
@@ -491,6 +492,7 @@ Use ASCII frames if your font lacks these glyphs."
 Call CALLBACK with stdout on success.  Keep stderr separate from table data.
 A newer request supersedes the pending request."
   (kubel--cancel-refresh)
+  (kubel--stop-auto-refresh)
   (add-hook 'kill-buffer-hook #'kubel--cancel-refresh nil t)
   (kubel--log-command "kubel-refresh" command)
   (let ((origin (current-buffer))
@@ -528,7 +530,10 @@ A newer request supersedes the pending request."
                                         (format "Command failed: %s" status)
                                       errors)))))))
                        (kill-buffer stdout)
-                       (kill-buffer stderr))))))
+                       (kill-buffer stderr)
+                       (when (buffer-live-p origin)
+                         (with-current-buffer origin
+                           (kubel--schedule-auto-refresh))))))))
           (when (get-buffer-process stderr)
             (set-process-sentinel (get-buffer-process stderr) #'ignore)
             (set-process-query-on-exit-flag (get-buffer-process stderr) nil))
@@ -539,7 +544,8 @@ A newer request supersedes the pending request."
       (error
        (kill-buffer stdout)
        (kill-buffer stderr)
-       (kubel--set-header-error (error-message-string err))))))
+       (kubel--set-header-error (error-message-string err))
+       (kubel--schedule-auto-refresh)))))
 
 (defun kubel--render-list (body)
   "Update the current resource table from BODY."
@@ -1602,6 +1608,7 @@ When called interactively, prompts for a buffer belonging to kubel."
     ("RET" "Resource details" kubel-describe-popup)
     ("E" "Quick edit" kubel-quick-edit)
     ("g" "Refresh" kubel-refresh)
+    ("G" "Auto refresh" kubel-auto-refresh-mode)
     ("b" "Buffers" kubel-switch-to-buffer)
     ("k" "Delete" kubel-delete-popup)
     ("r" "Rollout" kubel-rollout-history)]
@@ -1642,6 +1649,7 @@ When called interactively, prompts for a buffer belonging to kubel."
     (define-key map (kbd "n") 'kubel-set-namespace)
     (define-key map (kbd "y") 'kubel-list-namespaces)
     (define-key map (kbd "g") 'kubel-refresh)
+    (define-key map (kbd "C-c C-r") 'kubel-auto-refresh-mode)
     (define-key map (kbd "h") 'kubel-help-popup)
     (define-key map (kbd "?") 'kubel-help-popup)
     (define-key map (kbd "F") 'kubel-set-output-format)
@@ -1675,6 +1683,70 @@ When called interactively, prompts for a buffer belonging to kubel."
     map)
   "Keymap for `kubel-mode'.")
 
+(defcustom kubel-auto-refresh-interval 1
+  "Seconds to wait after a resource-list request completes before refreshing.
+Only visible buffers refresh, and requests never overlap."
+  :type 'number
+  :group 'kubel)
+
+(defvar-local kubel-auto-refresh-mode nil)
+
+(defvar-local kubel--auto-refresh-timer nil
+  "Timer for this buffer's automatic refreshes.")
+
+(defun kubel--stop-auto-refresh ()
+  "Stop this buffer's automatic refresh timer."
+  (when (timerp kubel--auto-refresh-timer)
+    (cancel-timer kubel--auto-refresh-timer))
+  (setq kubel--auto-refresh-timer nil))
+
+(defun kubel--disable-auto-refresh ()
+  "Disable automatic refresh before this buffer is killed or changes mode."
+  (setq kubel-auto-refresh-mode nil)
+  (kubel--stop-auto-refresh))
+
+(defun kubel--schedule-auto-refresh ()
+  "Schedule one refresh after the configured delay, unless a request is active."
+  (kubel--stop-auto-refresh)
+  (when (and kubel-auto-refresh-mode
+             (derived-mode-p 'kubel-mode)
+             (not (process-live-p kubel--refresh-process)))
+    (setq kubel--auto-refresh-timer
+          (run-at-time kubel-auto-refresh-interval nil
+                       #'kubel--auto-refresh-tick (current-buffer)))))
+
+(defun kubel--auto-refresh-tick (buffer)
+  "Refresh BUFFER when visible and no request is pending."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq kubel--auto-refresh-timer nil)
+      (when (and kubel-auto-refresh-mode (derived-mode-p 'kubel-mode))
+        (if (and (get-buffer-window buffer t)
+                 (not (process-live-p kubel--refresh-process)))
+            (let ((inhibit-message t))
+              (kubel-refresh nil t))
+          (kubel--schedule-auto-refresh))))))
+
+(define-minor-mode kubel-auto-refresh-mode
+  "Automatically refresh this resource buffer while it is visible.
+Wait `kubel-auto-refresh-interval' seconds after each completed request
+before starting another.  An initial request already in progress is allowed
+to finish first."
+  :lighter " Auto"
+  :group 'kubel
+  (kubel--stop-auto-refresh)
+  (when kubel-auto-refresh-mode
+    (unless (derived-mode-p 'kubel-mode)
+      (setq kubel-auto-refresh-mode nil)
+      (user-error "Auto refresh requires a kubel resource buffer"))
+    (unless (and (numberp kubel-auto-refresh-interval)
+                 (> kubel-auto-refresh-interval 0))
+      (setq kubel-auto-refresh-mode nil)
+      (user-error "Auto refresh interval must be positive"))
+    (add-hook 'kill-buffer-hook #'kubel--disable-auto-refresh nil t)
+    (add-hook 'change-major-mode-hook #'kubel--disable-auto-refresh nil t)
+    (kubel--schedule-auto-refresh)))
+
 (defun kubel--after-clone ()
   "Give cloned sessions independent process and timer state."
   (when (eq header-line-format kubel--activity-header-line)
@@ -1683,6 +1755,8 @@ When called interactively, prompts for a buffer belonging to kubel."
         kubel--refresh-process nil
         kubel--activity-processes nil
         kubel--activity-timer nil
+        kubel--auto-refresh-timer nil
+        kubel-auto-refresh-mode nil
         kubel--error-overlay nil
         kubel--header-error nil
         kubel--selected-items nil))
@@ -1695,10 +1769,11 @@ When called interactively, prompts for a buffer belonging to kubel."
               (format " (%s)" kubel-selector)))))
 
 ;;;###autoload
-(defun kubel-refresh (&optional directory)
+(defun kubel-refresh (&optional directory quiet)
   "Refresh the current kubel buffer, calling kubectl using the configured
 context, namespace, and resource asynchronously.
 Keep the current table visible until the request succeeds.
+QUIET suppresses completion messages for automatic refreshes.
 
 DIRECTORY is optional for TRAMP support."
   (interactive)
@@ -1716,8 +1791,9 @@ DIRECTORY is optional for TRAMP support."
        (append (list kubel-kubectl) (kubel--get-context-namespace)
                (kubel--get-selector) (list "get" kubel-resource)
                (when kubel-list-wide '("-o" "wide")))
-       #'kubel--render-list)
-    (kubel--init-context (lambda () (kubel-refresh)))))
+       (lambda (body)
+         (let ((inhibit-message quiet)) (kubel--render-list body))))
+    (kubel--init-context (lambda () (kubel-refresh nil quiet)))))
 
 ;;;###autoload
 (defun kubel-open (context namespace resource &optional directory)
