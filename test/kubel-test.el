@@ -145,6 +145,107 @@ does not accept `--selector' at all."
                      '("custom-kubectl" "config" "current-context")))
       (should (equal (caar tabulated-list-entries) "foo")))))
 
+(ert-deftest kubel--test-spinner-follows-concurrent-commands ()
+  "Finishing one command must not hide another command's indicator."
+  (save-window-excursion
+    (with-temp-buffer
+      (kubel-mode)
+      (setq kubel-kubectl "sh" kubel-context nil kubel-namespace "")
+      (let* ((origin (current-buffer))
+             (first (save-current-buffer
+                      (kubel--exec-async "kubel-test-first"
+                                         '("-c" "sleep 0.05; printf first"))))
+             (second (save-current-buffer
+                       (kubel--exec-async "kubel-test-second"
+                                          '("-c" "sleep 0.4; printf second")))))
+        (unwind-protect
+            (progn
+              (should (= 2 (length kubel--activity-processes)))
+              (should (string-match-p (regexp-quote "(+1)") (kubel--activity-status)))
+              (with-current-buffer (process-buffer second)
+                (should (equal kubel--activity-processes (list second)))
+                (should (timerp kubel--activity-timer)))
+              (kubel-test--wait first)
+              (with-current-buffer origin
+                (should (equal kubel--activity-processes (list second)))
+                (should (timerp kubel--activity-timer)))
+              (with-current-buffer (process-buffer first)
+                (should-not kubel--activity-processes)
+                (should-not kubel--activity-timer))
+              (let ((frame kubel--activity-frame))
+                (kubel-test--wait second)
+                (should (> kubel--activity-frame frame)))
+              (should-not kubel--activity-processes)
+              (should-not kubel--activity-timer)
+              (should-not (kubel--activity-status)))
+          (dolist (process (list first second))
+            (when (process-live-p process) (delete-process process))
+            (when (buffer-live-p (process-buffer process))
+              (kill-buffer (process-buffer process)))))))))
+
+(ert-deftest kubel--test-spinner-stops-on-failure-and-cancellation ()
+  (save-window-excursion
+    (dolist (cancel '(nil t))
+      (with-temp-buffer
+        (kubel-mode)
+        (setq kubel-kubectl "sh" kubel-context nil kubel-namespace "")
+        (let* ((called nil)
+               (process (save-current-buffer
+                          (kubel--exec-async
+                           "kubel-test-failure"
+                           (list "-c" (if cancel "sleep 1" "printf failed >&2; exit 1"))
+                           nil (lambda () (setq called t)))))
+               (errors (get-buffer (kubel--process-error-buffer "kubel-test-failure"))))
+          (when cancel (delete-process process))
+          (kubel-test--wait process)
+          (should-not called)
+          (should-not kubel--activity-processes)
+          (should-not kubel--activity-timer)
+          (should-not (buffer-live-p errors))
+          (with-current-buffer (process-buffer process)
+            (should-not kubel--activity-timer)
+            (unless cancel (should (equal kubel--header-error "failed"))))
+          (kill-buffer (process-buffer process)))))))
+
+(ert-deftest kubel--test-spinner-stops-when-buffer-is-killed ()
+  (let ((buffer (generate-new-buffer " *kubel-test-spinner*"))
+        process timer)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (kubel-mode)
+            (kubel--request '("sh" "-c" "sleep 1") #'ignore)
+            (setq process kubel--refresh-process
+                  timer kubel--activity-timer)
+            (should (timerp timer)))
+          (kill-buffer buffer)
+          (kubel-test--wait process)
+          (should-not (memq timer timer-list)))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest kubel--test-refresh-spinner-visible-without-mode-line-lighters ()
+  "The header shows activity even when the mode line omits minor modes."
+  (with-temp-buffer
+    (kubel-mode)
+    (setq-local mode-line-format '("%b"))
+    (setq-local minor-mode-alist nil)
+    (setq-local header-line-format "Original columns")
+    (kubel--request '("sh" "-c" "sleep 0.15; printf ready") #'ignore)
+    (should (eq header-line-format kubel--activity-header-line))
+    (should (string-match-p "Loading context" (eval (cadr header-line-format) t)))
+    (kubel-test--wait kubel--refresh-process)
+    (should (equal header-line-format "Original columns"))
+    (should-not kubel--activity-saved-header)))
+
+(ert-deftest kubel--test-spinner-keeps-new-header-set-during-request ()
+  "Finishing a command must not overwrite a header changed by another mode."
+  (with-temp-buffer
+    (kubel-mode)
+    (kubel--request '("sh" "-c" "sleep 0.05") #'ignore)
+    (setq-local header-line-format "New header")
+    (kubel-test--wait kubel--refresh-process)
+    (should (equal header-line-format "New header"))))
+
 ;; (ert "kubel--test-.*")
 
 (provide 'kubel-test)

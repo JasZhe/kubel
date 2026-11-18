@@ -106,6 +106,7 @@
 (require 'yaml-mode)
 (require 'tramp)
 (require 'subr-x)
+(require 'seq)
 (require 'eshell)
 (require 'dired)
 (require 'json)
@@ -394,6 +395,87 @@ Used for back-navigation when pressing q.")
   (setq kubel--namespace-list-cached nil)
   (setq kubel--label-values-cached nil))
 
+(defcustom kubel-spinner-frames '("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+  "Animation frames shown in the header and mode line while async commands run.
+Use ASCII frames if your font lacks these glyphs."
+  :type '(repeat string)
+  :group 'kubel)
+
+(defvar-local kubel--activity-processes nil
+  "Async commands currently running for this buffer.")
+(defvar-local kubel--activity-timer nil
+  "Timer animating this buffer's activity indicator.")
+(defvar-local kubel--activity-frame 0
+  "Current animation frame.")
+(defvar-local kubel--activity-saved-header nil
+  "Header format to restore when this buffer's commands finish.")
+(defconst kubel--activity-header-line '(:eval (kubel--activity-status))
+  "Header format used while async commands are running.")
+
+(defun kubel--activity-status ()
+  "Return the header and mode-line activity indicator for this buffer."
+  (when kubel--activity-processes
+    (let ((count (length kubel--activity-processes)))
+      (format " %s %s%s"
+              (if (zerop (length kubel-spinner-frames)) "…"
+                (elt kubel-spinner-frames
+                     (mod kubel--activity-frame (length kubel-spinner-frames))))
+              (replace-regexp-in-string
+               "%" "%%" (truncate-string-to-width
+                         (or (process-get (car kubel--activity-processes)
+                                          'kubel-activity-label) "kubectl")
+                         50 nil nil "…"))
+              (if (> count 1) (format " (+%d)" (1- count)) "")))))
+
+(add-to-list 'minor-mode-alist
+             '(kubel--activity-processes (:eval (kubel--activity-status))))
+
+(defun kubel--activity-clear ()
+  "Stop this buffer's animation and clear its activity state."
+  (when (timerp kubel--activity-timer)
+    (cancel-timer kubel--activity-timer))
+  (when (eq header-line-format kubel--activity-header-line)
+    (setq header-line-format kubel--activity-saved-header))
+  (setq kubel--activity-timer nil
+        kubel--activity-processes nil
+        kubel--activity-saved-header nil)
+  (force-mode-line-update))
+
+(defun kubel--activity-start (process buffers label)
+  "Show PROCESS activity in BUFFERS, identified by LABEL."
+  (process-put process 'kubel-activity-label label)
+  (process-put process 'kubel-activity-buffers (delete-dups buffers))
+  (dolist (buffer (process-get process 'kubel-activity-buffers))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (unless kubel--activity-processes
+          (setq kubel--activity-saved-header header-line-format)
+          (setq-local header-line-format kubel--activity-header-line))
+        (push process kubel--activity-processes)
+        (add-hook 'kill-buffer-hook #'kubel--activity-clear nil t)
+        (add-hook 'change-major-mode-hook #'kubel--activity-clear nil t)
+        (unless kubel--activity-timer
+          (setq kubel--activity-frame 0
+                kubel--activity-timer
+                (run-at-time
+                 0.2 0.2
+                 (lambda ()
+                   (when (buffer-live-p buffer)
+                     (with-current-buffer buffer
+                       (setq kubel--activity-frame (1+ kubel--activity-frame))
+                       (force-mode-line-update)))))))
+        (force-mode-line-update)))))
+
+(defun kubel--activity-stop (process)
+  "Remove PROCESS from its buffers' activity indicators."
+  (dolist (buffer (process-get process 'kubel-activity-buffers))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (setq kubel--activity-processes (delq process kubel--activity-processes))
+        (unless kubel--activity-processes (kubel--activity-clear))
+        (force-mode-line-update))))
+  (process-put process 'kubel-activity-buffers nil))
+
 (defvar-local kubel--refresh-process nil
   "Process fetching the current resource list or initial context.")
 
@@ -424,6 +506,7 @@ A newer request supersedes the pending request."
                  :sentinel
                  (lambda (process _event)
                    (when (memq (process-status process) '(exit signal))
+                     (kubel--activity-stop process)
                      (unwind-protect
                          (when (buffer-live-p origin)
                            (with-current-buffer origin
@@ -448,7 +531,11 @@ A newer request supersedes the pending request."
                        (kill-buffer stderr))))))
           (when (get-buffer-process stderr)
             (set-process-sentinel (get-buffer-process stderr) #'ignore)
-            (set-process-query-on-exit-flag (get-buffer-process stderr) nil)))
+            (set-process-query-on-exit-flag (get-buffer-process stderr) nil))
+          (when (processp kubel--refresh-process)
+            (kubel--activity-start kubel--refresh-process (list origin)
+                                   (if kubel-context "Refreshing resources"
+                                     "Loading context"))))
       (error
        (kill-buffer stdout)
        (kill-buffer stderr)
@@ -625,51 +712,68 @@ NAME is the buffer name."
   "Return the error buffer name for the PROCESS-NAME."
   (format "*%s:err*" process-name))
 
-(defun kubel--sentinel (callback)
-  "Sentinel function used by `kubel--exec-async'.
-CALLBACK is called when process completes successfully."
-  (lambda (process event)
-    (let* ((process-name (process-name process))
-           (exit-status (process-exit-status process))
-           (error-buffer (kubel--process-error-buffer process-name)))
-      (kubel--append-to-process-buffer (format "[%s]\nexit-code: %s" process-name exit-status))
-      (if (eq 0 exit-status)
-          (progn
-            (kubel--clear-header-error)
-            (when callback (funcall callback)))
-        (kubel--handle-stderr (with-current-buffer error-buffer
-                                (buffer-string))))
-      ;; Clean up error buffer
-      (when (get-buffer error-buffer)
-        (kill-buffer error-buffer)))))
+(defun kubel--sentinel (callback origin error-buffer)
+  "Return a sentinel for an async command started in ORIGIN.
+Call CALLBACK in the output buffer on success and clean up ERROR-BUFFER."
+  (lambda (process _event)
+    (when (memq (process-status process) '(exit signal))
+      (kubel--activity-stop process)
+      (unwind-protect
+          (let ((exit-status (process-exit-status process))
+                (target (if (buffer-live-p (process-buffer process))
+                            (process-buffer process) origin)))
+            (kubel--append-to-process-buffer
+             (format "[%s]\nexit-code: %s" (process-name process) exit-status))
+            (when (buffer-live-p target)
+              (with-current-buffer target
+                (if (and (eq (process-status process) 'exit) (zerop exit-status))
+                    (progn
+                      (kubel--clear-header-error)
+                      (when callback (funcall callback)))
+                  (kubel--handle-stderr
+                   (if (buffer-live-p error-buffer)
+                       (with-current-buffer error-buffer (buffer-string))
+                     (format "Command failed: %s" exit-status)))))))
+        (when (buffer-live-p error-buffer)
+          (kill-buffer error-buffer))))))
 
 (defun kubel--exec-async (process-name args &optional readonly callback)
   "Run kubectl asynchronously with ARGS, showing output in a buffer.
 
-PROCESS-NAME is an identifier for the process.  Default to \"kubel-command\".
-ARGS is a list of arguments.
-CALLBACK is a function that will be executed when the command completes.
-READONLY if non-nil, buffer will be in `view-mode'."
+PROCESS-NAME identifies the process, defaulting to `kubel-command'.
+CALLBACK is called in the output buffer when the command succeeds.
+READONLY enables `view-mode'.  Show activity in the source and output buffers."
   (when (equal process-name "")
     (setq process-name "kubel-command"))
-  (let ((buffer-name (format "*kubel-resource:%s:%s:%s*" kubel-context kubel-namespace (string-join args "_")))
-        (error-buffer (kubel--process-error-buffer process-name))
-        (cmd (append (list kubel-kubectl) (kubel--get-context-namespace) args)))
+  (let* ((origin (current-buffer))
+         (buffer-name (format "*kubel-resource:%s:%s:%s*" kubel-context kubel-namespace (string-join args "_")))
+         (error-buffer (generate-new-buffer (kubel--process-error-buffer process-name)))
+         (cmd (append (list kubel-kubectl) (kubel--get-context-namespace) args))
+         process)
     (when (get-buffer buffer-name)
       (kill-buffer buffer-name))
-    (when (get-buffer error-buffer)
-      (kill-buffer error-buffer))
     (kubel--log-command process-name cmd)
-    (make-process :name process-name
-                  :buffer buffer-name
-                  :sentinel (kubel--sentinel callback)
-                  :file-handler t
-                  :stderr (get-buffer-create error-buffer)
-                  :command cmd)
+    (condition-case err
+        (setq process
+              (make-process :name process-name
+                            :buffer buffer-name
+                            :sentinel (kubel--sentinel callback origin error-buffer)
+                            :file-handler t
+                            :stderr error-buffer
+                            :command cmd))
+      (error (kill-buffer error-buffer)
+             (signal (car err) (cdr err))))
+    (when (get-buffer-process error-buffer)
+      (set-process-sentinel (get-buffer-process error-buffer) #'ignore)
+      (set-process-query-on-exit-flag (get-buffer-process error-buffer) nil))
     (pop-to-buffer-same-window buffer-name)
-    (if readonly
-        (with-current-buffer buffer-name
-          (view-mode)))))
+    (when readonly (view-mode))
+    (when (processp process)
+      (kubel--activity-start process (list origin (get-buffer buffer-name))
+                             (string-join
+                              (seq-take args (if (equal (car args) "patch") 3 2))
+                              " ")))
+    process))
 
 (defun kubel--get-resource-under-cursor ()
   "Utility function to get the name of the resource under the cursor.
@@ -1572,8 +1676,13 @@ When called interactively, prompts for a buffer belonging to kubel."
   "Keymap for `kubel-mode'.")
 
 (defun kubel--after-clone ()
-  "Give cloned sessions independent request state."
-  (setq kubel--refresh-process nil
+  "Give cloned sessions independent process and timer state."
+  (when (eq header-line-format kubel--activity-header-line)
+    (setq header-line-format kubel--activity-saved-header))
+  (setq kubel--activity-saved-header nil
+        kubel--refresh-process nil
+        kubel--activity-processes nil
+        kubel--activity-timer nil
         kubel--error-overlay nil
         kubel--header-error nil
         kubel--selected-items nil))
