@@ -55,6 +55,12 @@ To list the pods in your current context and namespace, call
 ```
 M-x kubel
 ```
+Opening and refreshing the resource list runs asynchronously, so Emacs stays
+responsive while kubectl is running. Pressing `g` again cancels the pending
+refresh. Failed refreshes preserve the current table and show an error; use `$`
+for details. Completion lookups (such as namespaces and resource types) still
+run synchronously.
+
 To set said namespace and context, respectively call
 ```
 M-x kubel-set-namespace

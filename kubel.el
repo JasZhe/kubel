@@ -394,13 +394,80 @@ Used for back-navigation when pressing q.")
   (setq kubel--namespace-list-cached nil)
   (setq kubel--label-values-cached nil))
 
-(defun kubel--populate-list ()
-  "Return a list with a tabulated list format and \"tabulated-list-entries\"."
-  (let*  ((body (kubel--exec-sync (concat (kubel--get-list-command-prefix) " get " kubel-resource (if kubel-list-wide " -o wide" ""))))
-          (entrylist (kubel--parse-body body)))
-    (when (string-prefix-p "No resources found" body)
-      (message "No resources found"))  ;; TODO exception here
-    (list (kubel--get-list-format entrylist) (kubel--get-list-entries entrylist))))
+(defvar-local kubel--refresh-process nil
+  "Process fetching the current resource list or initial context.")
+
+(defun kubel--cancel-refresh ()
+  "Cancel any pending request for this buffer."
+  (let ((process kubel--refresh-process))
+    (setq kubel--refresh-process nil)
+    (when (process-live-p process)
+      (delete-process process))))
+
+(defun kubel--request (command callback)
+  "Run COMMAND asynchronously for this buffer.
+Call CALLBACK with stdout on success.  Keep stderr separate from table data.
+A newer request supersedes the pending request."
+  (kubel--cancel-refresh)
+  (add-hook 'kill-buffer-hook #'kubel--cancel-refresh nil t)
+  (kubel--log-command "kubel-refresh" command)
+  (let ((origin (current-buffer))
+        (stdout (generate-new-buffer " *kubel-refresh*"))
+        (stderr (generate-new-buffer " *kubel-refresh-stderr*")))
+    (condition-case err
+        (progn
+          (setq kubel--refresh-process
+                (make-process
+                 :name "kubel-refresh" :buffer stdout :stderr stderr
+                 :command command :connection-type 'pipe :noquery t
+                 :file-handler t
+                 :sentinel
+                 (lambda (process _event)
+                   (when (memq (process-status process) '(exit signal))
+                     (unwind-protect
+                         (when (buffer-live-p origin)
+                           (with-current-buffer origin
+                             (when (eq process kubel--refresh-process)
+                               (setq kubel--refresh-process nil)
+                               (let ((output (with-current-buffer stdout (buffer-string)))
+                                     (errors (with-current-buffer stderr (buffer-string)))
+                                     (status (process-exit-status process)))
+                                 (kubel--append-to-process-buffer
+                                  (format "[kubel-refresh]\nexit-code: %s" status))
+                                 (if (and (eq (process-status process) 'exit)
+                                          (zerop status))
+                                     (progn
+                                       (kubel--clear-header-error)
+                                       (funcall callback output)
+                                       (kubel--handle-stderr errors))
+                                   (kubel--handle-stderr
+                                    (if (string-empty-p (string-trim errors))
+                                        (format "Command failed: %s" status)
+                                      errors)))))))
+                       (kill-buffer stdout)
+                       (kill-buffer stderr))))))
+          (when (get-buffer-process stderr)
+            (set-process-sentinel (get-buffer-process stderr) #'ignore)
+            (set-process-query-on-exit-flag (get-buffer-process stderr) nil)))
+      (error
+       (kill-buffer stdout)
+       (kill-buffer stderr)
+       (kubel--set-header-error (error-message-string err))))))
+
+(defun kubel--render-list (body)
+  "Update the current resource table from BODY."
+  (let ((entrylist (kubel--parse-body body)))
+    (setq tabulated-list-format (kubel--get-list-format entrylist))
+    (setq tabulated-list-entries (kubel--get-list-entries entrylist)))
+  (setq tabulated-list-sort-key nil)
+  (tabulated-list-init-header)
+  (let ((line-num (line-number-at-pos (point)))
+        (current-id (tabulated-list-get-id)))
+    (tabulated-list-print t)
+    (unless (equal current-id (tabulated-list-get-id))
+      (goto-char (point-min))
+      (forward-line (1- line-num))))
+  (kubel--current-state))
 
 (defun kubel--age-to-secs (age)
   "Convert AGE in format 1d2h3m4s to seconds."
@@ -1504,6 +1571,13 @@ When called interactively, prompts for a buffer belonging to kubel."
     map)
   "Keymap for `kubel-mode'.")
 
+(defun kubel--after-clone ()
+  "Give cloned sessions independent request state."
+  (setq kubel--refresh-process nil
+        kubel--error-overlay nil
+        kubel--header-error nil
+        kubel--selected-items nil))
+
 (defun kubel--current-state ()
   "Show in the Echo Area the current context, namespace, and resource."
   (message (concat
@@ -1514,7 +1588,8 @@ When called interactively, prompts for a buffer belonging to kubel."
 ;;;###autoload
 (defun kubel-refresh (&optional directory)
   "Refresh the current kubel buffer, calling kubectl using the configured
-context, namespace, and resource.
+context, namespace, and resource asynchronously.
+Keep the current table visible until the request succeeds.
 
 DIRECTORY is optional for TRAMP support."
   (interactive)
@@ -1527,21 +1602,13 @@ DIRECTORY is optional for TRAMP support."
           (kill-buffer (get-buffer name))))
     (rename-buffer name)
     (message (format "Running kubectl for: %s..." name)))
-  (let ((entries (kubel--populate-list)))
-    (setq tabulated-list-format (car entries))
-    (setq tabulated-list-entries (cadr entries)))   ; TODO handle "No resource found"
-  (setq tabulated-list-sort-key kubel--list-sort-key)
-  (setq tabulated-list-sort-key nil)
-  (tabulated-list-init-header)
-  (let ((line-num (line-number-at-pos (point)))
-        (current-id (tabulated-list-get-id)))
-    (tabulated-list-print t)
-    (unless (string-equal current-id (tabulated-list-get-id))
-      ;; tabulated-list could not follow the current entry, then fallback on
-      ;; keeping the same line.
-      (goto-char (point-min))
-      (forward-line (1- line-num))))
-  (kubel--current-state))
+  (if kubel-context
+      (kubel--request
+       (append (list kubel-kubectl) (kubel--get-context-namespace)
+               (kubel--get-selector) (list "get" kubel-resource)
+               (when kubel-list-wide '("-o" "wide")))
+       #'kubel--render-list)
+    (kubel--init-context (lambda () (kubel-refresh)))))
 
 ;;;###autoload
 (defun kubel-open (context namespace resource &optional directory)
@@ -1559,14 +1626,16 @@ DIRECTORY is optional for TRAMP support."
         (pop-to-buffer-same-window tmpname)
         (kubel-refresh directory)))))
 
-(defun kubel--init-context ()
-  "Initialize context and namespace if not already set.
-Defers the kubectl call until first use to avoid blocking Emacs startup."
-  (unless kubel-context
-    (setq kubel-context
-          (replace-regexp-in-string
-           "\n" "" (kubel--exec-sync "kubectl config current-context")))
-    (setq kubel-namespace kubel-default-namespace)))
+(defun kubel--init-context (callback)
+  "Initialize context asynchronously, then call CALLBACK."
+  (kubel--request
+   (list kubel-kubectl "config" "current-context")
+   (lambda (output)
+     (let ((context (string-trim output)))
+       (if (string-empty-p context)
+           (kubel--set-header-error "No current context configured")
+         (setq kubel-context context)
+         (funcall callback))))))
 
 ;;;###autoload
 (defun kubel (&optional directory)
@@ -1580,7 +1649,6 @@ DIRECTORY is optional for TRAMP support."
       (switch-to-buffer (current-buffer))
       (unless (eq major-mode 'kubel-mode)
         (kubel-mode))
-      (kubel--init-context)
       (kubel-refresh directory))))
 
 (define-derived-mode kubel-mode tabulated-list-mode "Kubel"
@@ -1593,6 +1661,7 @@ DIRECTORY is optional for TRAMP support."
   (setq-local tabulated-list-printer #'kubel--print-entry)
   (use-local-map kubel-mode-map)
   (hl-line-mode 1)
+  (add-hook 'clone-buffer-hook #'kubel--after-clone nil t)
   (run-mode-hooks 'kubel-mode-hook))
 
 (provide 'kubel)
