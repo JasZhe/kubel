@@ -410,6 +410,43 @@ does not accept `--selector' at all."
     (kubel-test--wait kubel--refresh-process)
     (should (equal header-line-format "New header"))))
 
+(ert-deftest kubel--test-auto-refresh-is-local-to-enabled-buffer ()
+  "Only the enabled buffer refreshes, even when another buffer is current."
+  (let ((first (generate-new-buffer " *kubel-test-auto-first*"))
+        (second (generate-new-buffer " *kubel-test-auto-second*"))
+        (kubel-auto-refresh-interval 0.05)
+        calls)
+    (unwind-protect
+        (cl-letf (((symbol-function 'get-buffer-window) (lambda (&rest _) t))
+                  ((symbol-function 'kubel-refresh)
+                   (lambda (&rest _) (push (current-buffer) calls))))
+          (with-current-buffer first
+            (kubel-mode)
+            (kubel-auto-refresh-mode 1))
+          (with-current-buffer second
+            (kubel-mode)
+            (should-not kubel-auto-refresh-mode)
+            (should-not kubel--auto-refresh-timer)
+            (kubel--auto-refresh-tick second)
+            (let ((deadline (+ (float-time) 2)))
+              (while (and (null calls) (< (float-time) deadline))
+                (accept-process-output nil 0.02)))
+            (should (equal calls (list first)))
+            (should-not kubel-auto-refresh-mode)
+            ;; Enabling the second buffer creates its own timer; disabling
+            ;; the first buffer must not cancel it.
+            (kubel-auto-refresh-mode 1)
+            (let ((timer kubel--auto-refresh-timer))
+              (with-current-buffer first (kubel-auto-refresh-mode -1))
+              (should (eq timer kubel--auto-refresh-timer))
+              (should (memq timer timer-list)))
+            (let ((deadline (+ (float-time) 2)))
+              (while (and (= (length calls) 1) (< (float-time) deadline))
+                (accept-process-output nil 0.02)))
+            (should (equal calls (list second first)))))
+      (kill-buffer first)
+      (kill-buffer second))))
+
 ;; (ert "kubel--test-.*")
 
 (provide 'kubel-test)
