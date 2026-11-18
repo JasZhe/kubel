@@ -41,6 +41,7 @@
 ;; R => set resource
 ;; g => refresh pods
 ;; C-c C-r => toggle automatic refresh
+;; C-c C-a => toggle all namespaces
 ;; E => quick edit
 ;; p => port forward pod
 ;; e => exec into pod
@@ -80,6 +81,7 @@
     ("E" "Quick edit" kubel-quick-edit)
     ("g" "Refresh" kubel-refresh)
     ("G" "Auto refresh" kubel-auto-refresh-mode)
+    ("A" "All namespaces" kubel-toggle-all-namespaces)
     ("d" "Delete" kubel-delete-popup) ;; can't use k here
     ("r" "Rollout" kubel-rollout-history)]
    ["" ;; based on current view
@@ -116,6 +118,7 @@
   (kbd "n") #'kubel-set-namespace
   (kbd "g") #'kubel-refresh
   (kbd "C-c C-r") #'kubel-auto-refresh-mode
+  (kbd "C-c C-a") #'kubel-toggle-all-namespaces
   (kbd "h") #'kubel-evil-help-popup
   (kbd "?") #'kubel-evil-help-popup
   (kbd "F") #'kubel-set-output-format

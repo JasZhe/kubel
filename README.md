@@ -79,6 +79,13 @@ request is still running, the delay begins when it finishes. Requests never
 overlap, hidden buffers pause polling, and closing a buffer stops its timer.
 This polls resource lists rather than opening a Kubernetes watch stream.
 
+Press `C-c C-a` (or run `M-x kubel-toggle-all-namespaces`) to toggle listing across
+all namespaces. Namespaced resources show a `NAMESPACE` column. Row actions and
+marked batch actions use each resource's namespace, including when names repeat.
+Cluster-scoped resources continue to show their normal columns. This requires
+permission to list the chosen resource across namespaces. Press `n` to open a
+specific namespace view.
+
 To set said namespace and context, respectively call
 ```
 M-x kubel-set-namespace
@@ -118,6 +125,7 @@ h => help popup
 E => quick edit any resource
 g => refresh
 C-c C-r => toggle automatic refresh
+C-c C-a => toggle all namespaces
 k => delete popup
 r => see the rollout history for resource
 p => port forward pod

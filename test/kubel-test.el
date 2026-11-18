@@ -223,6 +223,32 @@ does not accept `--selector' at all."
           (should-not (memq timer timer-list)))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
+(ert-deftest kubel--test-all-namespaces-identities-and-scopes ()
+  "Identical names in different namespaces remain distinct and actionable."
+  (with-temp-buffer
+    (kubel-mode)
+    (setq kubel-context "ctx" kubel-namespace "default" kubel-all-namespaces t)
+    (kubel--render-list
+     (concat (format "%-12s %-12s %s\n" "NAMESPACE" "NAME" "STATUS")
+             (format "%-12s %-12s %s\n" "alpha" "same" "Running")
+             (format "%-12s %-12s %s\n" "beta" "same" "Pending")))
+    (should (equal (mapcar #'car tabulated-list-entries)
+                   '(("alpha" . "same") ("beta" . "same"))))
+    (goto-char (point-min))
+    (should (equal (kubel--get-resource-under-cursor) "same"))
+    (should (equal (kubel--get-context-namespace) '("--context" "ctx" "-n" "alpha")))
+    (should (equal (kubel--get-context-namespace t) '("--context" "ctx" "--all-namespaces")))
+    (kubel-mark-item)
+    (should (equal kubel--selected-items '(("alpha" . "same"))))
+    (should (equal (kubel--effective-namespace) "beta"))
+    (kubel-mark-item)
+    (should (= 2 (length kubel--selected-items)))
+    ;; A refresh preserves both marks using the full namespace/name identity.
+    (kubel--get-list-entries '(("NAMESPACE" "NAME") ("alpha" "same") ("beta" "same")))
+    (should (= 2 (length kubel--selected-items)))
+    (kubel--get-list-entries '(("NAMESPACE" "NAME") ("beta" "same")))
+    (should (equal kubel--selected-items '(("beta" . "same"))))))
+
 (ert-deftest kubel--test-auto-refresh-delay-starts-after-completion ()
   "Enabling during a slow request waits until completion before starting a delay."
   (with-temp-buffer
