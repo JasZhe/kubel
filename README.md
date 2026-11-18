@@ -151,6 +151,12 @@ $ => show process buffer
 s => show only resources with specified label value
 ```
 
+With `kubel-evil-mode`, `g` remains a prefix (`gt` / `gT` switch tabs),
+`e` / `E` keep their Evil word motions, and `$` moves to the end of the line.
+Use `x` for exec, `X` for quick edit, `q` to kill the current buffer,
+`C-c C-g` to refresh, and `C-c C-p` to show the process log. The auto-refresh
+and all-namespaces toggles remain on `C-c C-r` and `C-c C-a`.
+
 ## Editing a resource
 
 After describing a resource in YAML format, you can edit the buffer and hit `C-c C-c` to apply your changes.

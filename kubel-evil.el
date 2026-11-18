@@ -39,12 +39,16 @@
 ;; C => set context
 ;; n => set namespace
 ;; R => set resource
-;; g => refresh pods
+;; C-c C-g => refresh pods
+;; gt / gT => next / previous tab
 ;; C-c C-r => toggle automatic refresh
 ;; C-c C-a => toggle all namespaces
-;; E => quick edit
+;; X => quick edit
 ;; p => port forward pod
-;; e => exec into pod
+;; x => exec into pod
+;; $ => end of line
+;; q => kill current buffer
+;; C-c C-p => show process buffer
 ;; o => describe popup
 ;; l => log popup
 ;; c => copy popup
@@ -78,7 +82,7 @@
   [["Actions"
     ;; global
     ("RET" "Resource details" kubel-describe-popup)
-    ("E" "Quick edit" kubel-quick-edit)
+    ("X" "Quick edit" kubel-quick-edit)
     ("g" "Refresh" kubel-refresh)
     ("G" "Auto refresh" kubel-auto-refresh-mode)
     ("A" "All namespaces" kubel-toggle-all-namespaces)
@@ -87,7 +91,7 @@
    ["" ;; based on current view
     ("p" "Port forward" kubel-port-forward-pod)
     ("l" "Logs" kubel-log-popup)
-    ("e" "Exec" kubel-exec-popup)
+    ("x" "Exec" kubel-exec-popup)
     ("a" "Restart deployment" kubel-restart-deployment) ;; can't use j here
     ("S" "Scale replicas" kubel-scale-replicas)]
    ["Settings"
@@ -116,7 +120,13 @@
   (kbd "K") #'kubel-set-kubectl-config-file
   (kbd "C") #'kubel-set-context
   (kbd "n") #'kubel-set-namespace
-  (kbd "g") #'kubel-refresh
+  ;; Keep g available as a prefix, and e/E available as word motions.
+  (kbd "g") nil
+  (kbd "e") nil
+  (kbd "E") nil
+  (kbd "gt") #'tab-bar-switch-to-next-tab
+  (kbd "gT") #'tab-bar-switch-to-prev-tab
+  (kbd "C-c C-g") #'kubel-refresh
   (kbd "C-c C-r") #'kubel-auto-refresh-mode
   (kbd "C-c C-a") #'kubel-toggle-all-namespaces
   (kbd "h") #'kubel-evil-help-popup
@@ -126,14 +136,16 @@
   (kbd "d") #'kubel-delete-popup
   (kbd "f") #'kubel-set-filter
   (kbd "r") #'kubel-rollout-history
-  (kbd "E") #'kubel-quick-edit
+  (kbd "X") #'kubel-quick-edit
   (kbd "M-n") #'kubel-jump-to-next-highlight
   (kbd "M-p") #'kubel-jump-to-previous-highlight
-  (kbd "$") #'kubel-show-process-buffer
+  (kbd "$") #'evil-end-of-line
+  (kbd "q") #'kill-current-buffer
+  (kbd "C-c C-p") #'kubel-show-process-buffer
   (kbd "p") #'kubel-port-forward-pod
   (kbd "l") #'kubel-log-popup
   (kbd "c") #'kubel-copy-popup
-  (kbd "e") #'kubel-exec-popup
+  (kbd "x") #'kubel-exec-popup
   (kbd "a") #'kubel-restart-deployment
   (kbd "S") #'kubel-scale-replicas
   (kbd "u") #'kubel-unmark-item

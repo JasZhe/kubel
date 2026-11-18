@@ -1,7 +1,7 @@
 (require 'package)
 
 (defconst make-packages
-  '(transient dash yaml-mode s))
+  '(transient dash yaml-mode s evil))
 
 (defun make-init ()
   (add-to-list 'package-archives '("melpa" . "https://melpa.org/packages/") t)
@@ -18,6 +18,8 @@
   (make-init)
   (load-file "/kubel/kubel.el")
   (load-file "/kubel/test/kubel-test.el")
+  (load-file "/kubel/kubel-evil.el")
+  (load-file "/kubel/test/kubel-evil-test.el")
   (ert-run-tests-batch-and-exit))
 
 (defun make-compile ()
