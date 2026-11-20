@@ -66,7 +66,8 @@ Async commands show an animated indicator in the header and mode line of the
 session and command output buffers, with the operation name and a count of
 additional running tasks. The header indicator remains visible with custom mode
 lines that hide minor modes. While a command runs, it temporarily replaces the
-normal header; the original header returns when all commands finish.
+normal header; the original header returns when all commands finish. Header space
+is reserved even when empty, so starting or stopping activity does not shift text.
 This includes refreshes, deletes, applies, patches, logs, and port forwards.
 The indicator stops when the command exits or is cancelled. For apply/patch,
 this indicates completion of the request, not readiness of the resulting pods.

@@ -419,12 +419,18 @@ Use ASCII frames if your font lacks these glyphs."
 (add-to-list 'minor-mode-alist
              '(kubel--activity-processes (:eval (kubel--activity-status))))
 
+(defun kubel--ensure-header-line ()
+  "Reserve header space even when this buffer has no status or column headings."
+  (unless header-line-format
+    (setq-local header-line-format "")))
+
 (defun kubel--activity-clear ()
   "Stop this buffer's animation and clear its activity state."
   (when (timerp kubel--activity-timer)
     (cancel-timer kubel--activity-timer))
   (when (eq header-line-format kubel--activity-header-line)
     (setq header-line-format kubel--activity-saved-header))
+  (kubel--ensure-header-line)
   (setq kubel--activity-timer nil
         kubel--activity-processes nil
         kubel--activity-saved-header nil)
@@ -438,6 +444,7 @@ Use ASCII frames if your font lacks these glyphs."
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         (unless kubel--activity-processes
+          (kubel--ensure-header-line)
           (setq kubel--activity-saved-header header-line-format)
           (setq-local header-line-format kubel--activity-header-line))
         (push process kubel--activity-processes)
@@ -542,6 +549,7 @@ A newer request supersedes the pending request."
     (setq tabulated-list-entries (kubel--get-list-entries entrylist)))
   (setq tabulated-list-sort-key nil)
   (tabulated-list-init-header)
+  (kubel--ensure-header-line)
   (let ((line-num (line-number-at-pos (point)))
         (current-id (tabulated-list-get-id)))
     (tabulated-list-print t)
@@ -762,6 +770,8 @@ READONLY enables `view-mode'.  Show activity in the source and output buffers."
     (when (get-buffer-process error-buffer)
       (set-process-sentinel (get-buffer-process error-buffer) #'ignore)
       (set-process-query-on-exit-flag (get-buffer-process error-buffer) nil))
+    (with-current-buffer (get-buffer buffer-name)
+      (kubel--ensure-header-line))
     (pop-to-buffer-same-window buffer-name)
     (when readonly (view-mode))
     (when (processp process)
@@ -975,7 +985,8 @@ If no parent buffer exists, call `quit-window'."
 
 Allows simple apply of the changes made.
 
-\\{kubel-yaml-editing-mode-map}")
+\\{kubel-yaml-editing-mode-map}"
+  (kubel--ensure-header-line))
 
 (defun kubel-apply ()
   "Save the current buffer to a temp file and try to kubectl apply it."
@@ -2125,6 +2136,7 @@ to finish first."
   "Give cloned sessions independent process and timer state."
   (when (eq header-line-format kubel--activity-header-line)
     (setq header-line-format kubel--activity-saved-header))
+  (kubel--ensure-header-line)
   (setq kubel--resource-prompt-token nil
         kubel--namespace-prompt-token nil
         kubel--activity-saved-header nil
@@ -2221,6 +2233,7 @@ DIRECTORY is optional for TRAMP support."
   (setq mode-name "Kubel")
   (setq major-mode 'kubel-mode)
   (setq-local tabulated-list-printer #'kubel--print-entry)
+  (kubel--ensure-header-line)
   (use-local-map kubel-mode-map)
   (hl-line-mode 1)
   (add-hook 'clone-buffer-hook #'kubel--after-clone nil t)
