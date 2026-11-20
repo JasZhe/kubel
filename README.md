@@ -92,9 +92,23 @@ To set said namespace and context, respectively call
 M-x kubel-set-namespace
 M-x kubel-set-context
 ```
-Note that context will autocomplete but not necessarily namespaces
-depending on your permissions and cluster setup.
-See the [customize section](#Customize) on how to tune `kubel-use-namespace-list`.
+Namespace completion opens immediately using cached names, namespace history,
+and the current/default namespace. Missing or expired lists refresh in the
+background; newly fetched names appear the next time you open completion.
+Typing a namespace manually is always supported.
+
+Use `C-u M-x kubel-set-namespace` (or `C-u n`) to request fresh candidates before
+opening the prompt. The fetch is asynchronous, so Emacs stays responsive.
+If it fails, the previous names or history remain available. The prefix argument
+refreshes namespace data only, leaving resource and label caches intact.
+When viewing the namespace resource list, `n` still selects the current row or
+single marked namespace directly.
+
+Namespace caches are shared by sessions using the same context, kubeconfig,
+kubectl executable, execution directory (including TRAMP), and namespace-list
+policy. Namespace fetching is independent of resource auto-refresh and does not
+run a permanent polling timer. Completion lists already open are not changed.
+See the [customize section](#Customize) for TTL and permission settings.
 
 To switch to showing a different resource, use the `R` command or
 ```
@@ -175,10 +189,15 @@ restart was requested; use automatic refresh to follow pod progress.
 
 - By default, kubel log tails from the last 100 lines, you can change the `kubel-log-tail-n` variable to set another line number.
 - If you need to switch or set your kubectl config file by setting your `KUBECONFIG` environment variable, you can use the wrapper function `kubel-set-kubectl-config-file` or the `K` shortcut.
+- `kubel-namespace-cache-ttl` defaults to 300 seconds. Set it to `nil` to keep cached
+  results until explicitly refreshed, or `0` to revalidate on each invocation.
+- `kubel-namespace-request-timeout` defaults to `"30s"` for namespace discovery requests.
+- `kubel-namespace-cache-retry-delay` defaults to 30 seconds after a failed request;
+  the prefix argument bypasses that delay. Failures retain the last successful list.
 - Namespace listing for auto-completion is controlled by `kubel-use-namespace-list`:
-  - auto - default, use `kubectl auth can-i list namespace` to determine if we can list namespaces
-  - on - always assume we can list namespaces
-  - off - always assume we cannot list namespaces
+  - auto - default, check permissions asynchronously and cache both allowed and denied results
+  - on - fetch namespace lists asynchronously without a separate permission check
+  - off - use namespace history and defaults without issuing namespace requests
 
 ## Releases
 

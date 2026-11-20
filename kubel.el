@@ -109,6 +109,7 @@
 (require 'tramp)
 (require 'subr-x)
 (require 'seq)
+(require 'cl-lib)
 (require 'eshell)
 (require 'dired)
 (require 'json)
@@ -241,10 +242,9 @@ false  - do not use '-o wide' for list views, hiding additional columns"
 (defcustom kubel-use-namespace-list 'auto
   "Control behavior for namespace completion.
 
-auto - default, use `kubectl auth can-i list namespace` to determine if we can
-       list namespaces
-on   - always assume we can list namespaces
-off  - always assume we cannot list namespaces"
+auto - check list permissions asynchronously and cache the result
+on   - fetch namespace names asynchronously without a permission check
+off  - use namespace history and defaults without fetching"
   :type '(choice (const :tag "Auto" auto)
                  (const :tag "On" on)
                  (const :tag "Off" off))
@@ -372,10 +372,6 @@ If SILENCE-WARNINGS is non-nil, stderr output is not displayed."
 (defvar kubel-selector-history '()
   "List of previously used selectors.")
 
-(defvar-local kubel--can-get-namespace-cached nil)
-
-(defvar kubel--namespace-list-cached nil)
-
 (defvar-local kubel--label-values-cached nil)
 
 (defvar-local kubel--selected-items '())
@@ -396,8 +392,6 @@ Used for back-navigation when pressing q.")
 (defun kubel--invalidate-context-caches ()
   "Invalidate the context caches."
   (setq kubel--kubernetes-resources-list-cached nil)
-  (setq kubel--can-get-namespace-cached nil)
-  (setq kubel--namespace-list-cached nil)
   (setq kubel--label-values-cached nil))
 
 (defcustom kubel-spinner-frames '("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
@@ -1120,32 +1114,199 @@ ARGS is the arguments list from transient."
         (setenv "KUBECONFIG" (expand-file-name configfile))
       (error "Kubectl config file '%s' does not exist!" configfile))))
 
-(defun kubel--can-get-namespace ()
-  "Determine if permissions allow for `kubectl get namespace` in current context."
-  (cond ((eq kubel-use-namespace-list 'on) t)
-        ((eq kubel-use-namespace-list 'auto)
-         (progn
-           (unless kubel--can-get-namespace-cached
-             (setq kubel--can-get-namespace-cached
-                   (string-match-p "yes"
-                                   (kubel--exec-sync
-                                    (format "%s --context %s auth can-i list namespaces" kubel-kubectl kubel-context)
-                                    t)))))  ; silence warnings
-         kubel--can-get-namespace-cached)))
+(defcustom kubel-namespace-cache-ttl 300
+  "Seconds namespace completion data stays fresh.
+Nil means cached results never expire; zero revalidates on every invocation.
+Expired results remain usable while they refresh asynchronously."
+  :type '(choice (const :tag "Never expire" nil) (number :tag "Seconds"))
+  :group 'kubel)
 
-(defun kubel--get-namespace ()
-  "Get namespaces for current context, try to recover from cache first."
-  (unless kubel--namespace-list-cached
-    (setq kubel--namespace-list-cached
-          (split-string (kubel--exec-sync
-                         (format "%s --context %s get namespace -o jsonpath='{.items[*].metadata.name}'" kubel-kubectl kubel-context)) " ")))
-  kubel--namespace-list-cached)
+(defcustom kubel-namespace-request-timeout "30s"
+  "Kubectl request timeout for background namespace discovery."
+  :type 'string
+  :group 'kubel)
+
+(defcustom kubel-namespace-cache-retry-delay 30
+  "Seconds to wait before automatically retrying a failed namespace request.
+A prefix argument to `kubel-set-namespace' bypasses this delay."
+  :type 'number
+  :group 'kubel)
+
+(cl-defstruct (kubel--namespace-entry (:constructor kubel--make-namespace-entry))
+  names fetched-at permission permission-at retry-after process callbacks)
+
+(defvar kubel--namespace-cache (make-hash-table :test #'equal)
+  "Namespace completion entries keyed by context and execution configuration.")
+
+(defvar-local kubel--namespace-prompt-token nil
+  "Identity of the latest namespace selection requested in this buffer.")
+
+(defun kubel--namespace-cache-key ()
+  "Identify this session's namespace execution configuration."
+  (list kubel-context kubel-kubectl (getenv "KUBECONFIG")
+        default-directory kubel-use-namespace-list))
+
+(defun kubel--namespace-entry ()
+  "Return or create the namespace completion entry for this session."
+  (let* ((key (kubel--namespace-cache-key))
+         (entry (gethash key kubel--namespace-cache)))
+    (or entry
+        (puthash key (kubel--make-namespace-entry) kubel--namespace-cache))))
+
+(defun kubel--namespace-fresh-p (timestamp)
+  "Return non-nil if TIMESTAMP is within the namespace cache TTL."
+  (and timestamp
+       (or (null kubel-namespace-cache-ttl)
+           (< (- (float-time) timestamp) kubel-namespace-cache-ttl))))
+
+(defun kubel--namespace-candidates ()
+  "Return cached names plus history and defaults without contacting Kubernetes."
+  (let ((entry (kubel--namespace-entry)))
+    (delete-dups
+     (append (unless (or (eq kubel-use-namespace-list 'off)
+                         (eq (kubel--namespace-entry-permission entry) 'denied))
+               (copy-sequence (kubel--namespace-entry-names entry)))
+             (copy-sequence kubel-namespace-history)
+             (unless (string-empty-p kubel-namespace) (list kubel-namespace))
+             (list kubel-default-namespace)))))
+
+(defun kubel--namespace-exec (entry command origin callback)
+  "Run COMMAND independently of resource refreshes for ENTRY.
+Show activity in ORIGIN and call CALLBACK with exit status, stdout and stderr.
+Execution uses the current `default-directory' and `process-environment'."
+  (let ((stdout (generate-new-buffer " *kubel-namespaces*"))
+        (stderr (generate-new-buffer " *kubel-namespaces-stderr*")))
+    (condition-case err
+        (let ((process
+               (make-process
+                :name "kubel-namespaces" :buffer stdout :stderr stderr
+                :command command :connection-type 'pipe :noquery t :file-handler t
+                :sentinel
+                (lambda (process _event)
+                  (when (and (memq (process-status process) '(exit signal))
+                             (not (process-get process 'kubel-namespace-finished)))
+                    (process-put process 'kubel-namespace-finished t)
+                    (when (eq process (kubel--namespace-entry-process entry))
+                      (setf (kubel--namespace-entry-process entry) nil))
+                    (let ((status (process-exit-status process))
+                          (output (with-current-buffer stdout (buffer-string)))
+                          (errors (with-current-buffer stderr (buffer-string))))
+                      (unwind-protect
+                          (progn
+                            (kubel--append-to-process-buffer
+                             (format "[kubel-namespaces]\nexit-code: %s" status))
+                            (unless (string-empty-p (string-trim errors))
+                              (kubel--append-to-process-buffer
+                               (format "stderr: %s" (string-trim errors)))))
+                        (kubel--activity-stop process)
+                        (kill-buffer stdout)
+                        (kill-buffer stderr))
+                      (funcall callback status output errors)))))))
+          (unless (processp process)
+            (error "Asynchronous namespace requests are unavailable here"))
+          (setf (kubel--namespace-entry-process entry) process)
+          (when (get-buffer-process stderr)
+            (set-process-sentinel (get-buffer-process stderr) #'ignore)
+            (set-process-query-on-exit-flag (get-buffer-process stderr) nil))
+          (when (buffer-live-p origin)
+            (with-current-buffer origin
+              (kubel--log-command "kubel-namespaces" command)))
+          (kubel--activity-start process (list origin) "Updating namespaces")
+          process)
+      (error
+       (kill-buffer stdout)
+       (kill-buffer stderr)
+       (setf (kubel--namespace-entry-process entry) nil)
+       (funcall callback 'failed "" (error-message-string err))
+       nil))))
+
+(defun kubel--namespace-finish (entry &optional error-message)
+  "Finish updating ENTRY and notify its waiting callers.
+Preserve old data and delay retries when ERROR-MESSAGE is non-nil."
+  (when error-message
+    (setf (kubel--namespace-entry-retry-after entry)
+          (+ (float-time) kubel-namespace-cache-retry-delay))
+    (kubel--append-to-process-buffer
+     (format "Namespace refresh failed: %s" (string-trim error-message)))
+    (message "Kubel namespace refresh failed; using cached names or history"))
+  (let ((callbacks (kubel--namespace-entry-callbacks entry)))
+    (setf (kubel--namespace-entry-callbacks entry) nil)
+    (dolist (callback callbacks)
+      ;; Never open a completion prompt inside a process sentinel.
+      (run-at-time 0 nil callback))))
+
+(defun kubel--refresh-namespace-cache (&optional force callback)
+  "Refresh this session's namespace cache asynchronously if needed.
+FORCE bypasses freshness and retry delays.  CALLBACK runs when the request
+finishes, including failures.  Concurrent callers share the pending request."
+  (let* ((entry (kubel--namespace-entry))
+         (origin (current-buffer))
+         (directory default-directory)
+         (environment (copy-sequence process-environment))
+         (policy kubel-use-namespace-list)
+         (prefix (append (list kubel-kubectl)
+                         (when (and kubel-context (not (string-empty-p kubel-context)))
+                           (list "--context" kubel-context))
+                         (list (concat "--request-timeout=" kubel-namespace-request-timeout)))))
+    (cond
+     ((eq policy 'off) (when callback (funcall callback)))
+     ((processp (kubel--namespace-entry-process entry))
+      (when callback (push callback (kubel--namespace-entry-callbacks entry))))
+     ((and (not force)
+           (or (and (kubel--namespace-entry-retry-after entry)
+                    (< (float-time) (kubel--namespace-entry-retry-after entry)))
+               (and (eq (kubel--namespace-entry-permission entry) 'denied)
+                    (kubel--namespace-fresh-p (kubel--namespace-entry-permission-at entry)))
+               (kubel--namespace-fresh-p (kubel--namespace-entry-fetched-at entry))))
+      (when callback (funcall callback)))
+     (t
+      (when callback (push callback (kubel--namespace-entry-callbacks entry)))
+      (cl-labels
+          ((run (args handler)
+             (let ((default-directory directory)
+                   (process-environment environment))
+               (kubel--namespace-exec entry (append prefix args) origin handler)))
+           (failed (errors)
+             (kubel--namespace-finish entry
+                                      (if (string-empty-p (string-trim errors))
+                                          "Namespace command failed" errors)))
+           (fetch ()
+             (run '("get" "namespaces" "-o" "jsonpath={.items[*].metadata.name}")
+                  (lambda (status output errors)
+                    (if (equal status 0)
+                        (progn
+                          (setf (kubel--namespace-entry-names entry)
+                                (sort (delete-dups (split-string output "[ \t\r\n]+" t)) #'string-lessp)
+                                (kubel--namespace-entry-fetched-at entry) (float-time)
+                                (kubel--namespace-entry-permission entry) 'allowed
+                                (kubel--namespace-entry-permission-at entry) (float-time)
+                                (kubel--namespace-entry-retry-after entry) nil)
+                          (kubel--namespace-finish entry))
+                      (failed errors))))))
+        (if (or (eq policy 'on)
+                (and (not force)
+                     (eq (kubel--namespace-entry-permission entry) 'allowed)
+                     (kubel--namespace-fresh-p (kubel--namespace-entry-permission-at entry))))
+            (fetch)
+          (run '("auth" "can-i" "list" "namespaces")
+               (lambda (status output errors)
+                 (cond
+                  ((and (equal status 0) (equal (string-trim output) "yes"))
+                   (setf (kubel--namespace-entry-permission entry) 'allowed
+                         (kubel--namespace-entry-permission-at entry) (float-time))
+                   (fetch))
+                  ((and (memq status '(0 1)) (equal (string-trim output) "no"))
+                   (setf (kubel--namespace-entry-permission entry) 'denied
+                         (kubel--namespace-entry-permission-at entry) (float-time)
+                         (kubel--namespace-entry-retry-after entry) nil)
+                   (message "Kubel cannot list namespaces; using namespace history")
+                   (kubel--namespace-finish entry))
+                  (t (failed errors)))))))))))
 
 (defun kubel--list-namespace ()
-  "List namespace, either from history, or dynamically if possible."
-  (if (kubel--can-get-namespace)
-      (kubel--get-namespace)
-    kubel-namespace-history))
+  "Return namespace candidates immediately and revalidate them in the background."
+  (prog1 (kubel--namespace-candidates)
+    (kubel--refresh-namespace-cache)))
 
 (defun kubel--add-namespace-to-history (namespace)
   "Add NAMESPACE to history if it isn't there already."
@@ -1168,39 +1329,63 @@ ARGS is the arguments list from transient."
       (switch-to-buffer (current-buffer))
       (kubel-refresh last-default-directory))))
 
-(defun kubel-set-namespace (&optional refresh)
-  "Set the namespace.
-If called with a prefix argument REFRESH, refreshes
-the context caches, including the cached resource list.
-When viewing namespaces, selects the namespace under cursor,
-or the marked namespace if exactly one is marked."
-  (interactive "P")
-  (when refresh (kubel--invalidate-context-caches))
-  (let* ((from-namespace-list (equal kubel-resource "namespaces"))
-         (namespace (if from-namespace-list
-                        (cond
-                         ((> (length kubel--selected-items) 1)
-                          (user-error "Cannot set namespace: multiple namespaces are marked"))
-                         ((= (length kubel--selected-items) 1)
-                          (car kubel--selected-items))
-                         (t
-                          (kubel--get-resource-under-cursor)))
-                      (completing-read "Namespace: " (kubel--list-namespace)
-                                       nil nil nil nil "default")))
-         (kubel--buffer (get-buffer (kubel--buffer-name)))
-         (parent-buffer (current-buffer))
-         (last-default-directory (when kubel--buffer
-                                   (with-current-buffer kubel--buffer default-directory))))
+(defun kubel--open-namespace (namespace)
+  "Open a cloned session for NAMESPACE, preserving the current session."
+  (let ((parent-buffer (current-buffer))
+        (directory default-directory)
+        (from-namespace-list (equal kubel-resource "namespaces")))
     (with-current-buffer (clone-buffer)
-      (setq kubel--parent-buffer parent-buffer)
-      (setq kubel-namespace namespace
+      (setq kubel--parent-buffer parent-buffer
+            kubel-namespace namespace
             kubel-all-namespaces nil
             kubel--selected-items nil)
-      (when from-namespace-list
-        (setq kubel-resource "pods"))
+      (when from-namespace-list (setq kubel-resource "pods"))
       (kubel--add-namespace-to-history namespace)
       (switch-to-buffer (current-buffer))
-      (kubel-refresh last-default-directory))))
+      (kubel-refresh directory))))
+
+(defun kubel--prompt-namespace (candidates)
+  "Prompt using CANDIDATES and open the chosen namespace."
+  (kubel--open-namespace
+   (completing-read "Namespace: " candidates nil nil nil nil kubel-default-namespace)))
+
+(defun kubel--namespace-prompt-ready (origin key token)
+  "Open the namespace prompt for ORIGIN if KEY and TOKEN still match.
+Wait until any existing minibuffer prompt has closed."
+  (when (and (buffer-live-p origin)
+             (with-current-buffer origin
+               (and (derived-mode-p 'kubel-mode)
+                    (eq token kubel--namespace-prompt-token)
+                    (equal key (kubel--namespace-cache-key)))))
+    (if (active-minibuffer-window)
+        (run-at-time 0.1 nil #'kubel--namespace-prompt-ready origin key token)
+      (pop-to-buffer-same-window origin)
+      (setq kubel--namespace-prompt-token nil)
+      (kubel--prompt-namespace (kubel--namespace-candidates)))))
+
+(defun kubel-set-namespace (&optional refresh)
+  "Choose a namespace using cached completion candidates immediately.
+Revalidate expired candidates asynchronously.  With prefix argument REFRESH,
+fetch fresh candidates asynchronously before opening the prompt; retain cached
+names or history if fetching fails.  Other resource caches are unaffected.
+When viewing namespaces, select the namespace under point or the single mark."
+  (interactive "P")
+  (setq kubel--namespace-prompt-token nil)
+  (cond
+   ((equal kubel-resource "namespaces")
+    (kubel--open-namespace
+     (cond ((> (length kubel--selected-items) 1)
+            (user-error "Cannot set namespace: multiple namespaces are marked"))
+           (kubel--selected-items (car kubel--selected-items))
+           (t (kubel--get-resource-under-cursor)))))
+   (refresh
+    (let ((origin (current-buffer))
+          (key (kubel--namespace-cache-key))
+          (token (list 'namespace-prompt)))
+      (setq kubel--namespace-prompt-token token)
+      (kubel--refresh-namespace-cache
+       t (lambda () (kubel--namespace-prompt-ready origin key token)))))
+   (t (kubel--prompt-namespace (kubel--list-namespace)))))
 
 (defun kubel-set-context ()
   "Set the context."
@@ -1799,7 +1984,8 @@ to finish first."
   "Give cloned sessions independent process and timer state."
   (when (eq header-line-format kubel--activity-header-line)
     (setq header-line-format kubel--activity-saved-header))
-  (setq kubel--activity-saved-header nil
+  (setq kubel--namespace-prompt-token nil
+        kubel--activity-saved-header nil
         kubel--refresh-process nil
         kubel--activity-processes nil
         kubel--activity-timer nil
