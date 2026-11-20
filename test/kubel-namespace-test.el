@@ -18,6 +18,7 @@
        (setq kubel-context "ctx" kubel-namespace "current")
        (let ((kubel-kubectl "kubectl")
              (kubel--namespace-cache (make-hash-table :test #'equal))
+             (kubel--resource-cache (make-hash-table :test #'equal))
              (kubel-use-namespace-list 'auto)
              (kubel-namespace-cache-ttl 300)
              (kubel-namespace-request-timeout "30s")
@@ -95,8 +96,8 @@
 (ert-deftest kubel-namespace--test-force-waits-for-fresh-candidates-only ()
   (kubel-namespace-test--with-session
     (let ((entry (kubel--namespace-entry)) prompted)
-      (setq kubel--kubernetes-resources-list-cached '("pods")
-            kubel--label-values-cached '("app=test"))
+      (setq kubel--label-values-cached '("app=test"))
+      (setf (kubel--resource-entry-names (kubel--resource-entry)) '("pods"))
       (setf (kubel--namespace-entry-names entry) '("old")
             (kubel--namespace-entry-fetched-at entry) (float-time)
             (kubel--namespace-entry-retry-after entry) (+ (float-time) 100))
@@ -110,7 +111,7 @@
           (kubel-namespace-test--wait entry)
           (should (member "fresh" prompted))
           (should-not (member "old" prompted))
-          (should (equal kubel--kubernetes-resources-list-cached '("pods")))
+          (should (equal (kubel--resource-entry-names (kubel--resource-entry)) '("pods")))
           (should (equal kubel--label-values-cached '("app=test"))))))))
 
 (ert-deftest kubel-namespace--test-failure-retains-cache-and-throttles-retries ()

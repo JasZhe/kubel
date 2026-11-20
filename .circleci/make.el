@@ -19,6 +19,7 @@
   (load-file "/kubel/kubel.el")
   (load-file "/kubel/test/kubel-test.el")
   (load-file "/kubel/test/kubel-namespace-test.el")
+  (load-file "/kubel/test/kubel-resource-test.el")
   (load-file "/kubel/kubel-evil.el")
   (load-file "/kubel/test/kubel-evil-test.el")
   (ert-run-tests-batch-and-exit))

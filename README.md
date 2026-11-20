@@ -58,8 +58,9 @@ M-x kubel
 Opening and refreshing the resource list runs asynchronously, so Emacs stays
 responsive while kubectl is running. Pressing `g` again cancels the pending
 refresh. Failed refreshes preserve the current table and show an error; use `$`
-for details. Completion lookups (such as namespaces and resource types) still
-run synchronously.
+for details. Namespace and resource-type completion use caches with asynchronous
+background updates. Some other lookups, such as container names, still run
+synchronously.
 
 Async commands show an animated indicator in the header and mode line of the
 session and command output buffers, with the operation name and a count of
@@ -116,7 +117,20 @@ To switch to showing a different resource, use the `R` command or
 ```
 M-x kubel-set-resource
 ```
-This will let you select a resource and re-display the kubel buffer.
+`R` opens resource-type completion immediately using cached discovery results,
+resource history, and the current resource type (or `pods`). Missing or expired
+lists refresh in the background. Newly discovered types, including CRDs, appear
+on the next invocation; typing a type manually always works.
+
+Use `C-u R` (or `C-u M-x kubel-set-resource`) to fetch fresh resource types
+asynchronously before opening completion. Failed requests retain cached types
+or history, and do not clear namespace or label caches. Resource discovery uses
+the same normalized configuration key as namespace caching, without depending
+on the current namespace or namespace-list permission policy. It runs separately
+from namespace fetching and resource auto-refresh, with no permanent polling.
+
+Quick edit also uses cached resource-type candidates; fetching individual
+resource names after choosing a type still uses the existing lookup.
 
 
 To programmatically open a session for a specific context/namespace/resource, call `kubel-open` from elisp
@@ -191,6 +205,10 @@ restart was requested; use automatic refresh to follow pod progress.
 
 - By default, kubel log tails from the last 100 lines, you can change the `kubel-log-tail-n` variable to set another line number.
 - If you need to switch or set your kubectl config file by setting your `KUBECONFIG` environment variable, you can use the wrapper function `kubel-set-kubectl-config-file` or the `K` shortcut.
+- `kubel-resource-cache-ttl` defaults to 300 seconds for API resource types; `nil`
+  disables expiry and `0` revalidates on every invocation.
+- `kubel-resource-cache-retry-delay` defaults to 30 seconds after discovery failures.
+- `kubel-resource-request-timeout` defaults to `"30s"` for API resource discovery.
 - `kubel-namespace-cache-ttl` defaults to 300 seconds. Set it to `nil` to keep cached
   results until explicitly refreshed, or `0` to revalidate on each invocation.
 - `kubel-namespace-request-timeout` defaults to `"30s"` for namespace discovery requests.

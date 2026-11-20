@@ -376,22 +376,12 @@ If SILENCE-WARNINGS is non-nil, stderr output is not displayed."
 
 (defvar-local kubel--selected-items '())
 
-(defvar-local kubel--kubernetes-resources-list-cached nil)
-
 (defvar-local kubel--parent-buffer nil
   "The buffer that spawned this kubel buffer.
 Used for back-navigation when pressing q.")
 
-(defun kubel--kubernetes-resources-list ()
-  "Get list of resources from cache or from fetching the api resource."
-  (if (null kubel--kubernetes-resources-list-cached)
-      (setq kubel--kubernetes-resources-list-cached
-            (kubel--fetch-api-resource-list))
-    kubel--kubernetes-resources-list-cached))
-
 (defun kubel--invalidate-context-caches ()
-  "Invalidate the context caches."
-  (setq kubel--kubernetes-resources-list-cached nil)
+  "Invalidate buffer-local context caches."
   (setq kubel--label-values-cached nil))
 
 (defcustom kubel-spinner-frames '("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
@@ -1153,8 +1143,8 @@ relative remote directory when its absolute location is not yet known."
         (expand-file-name (concat "./" path) directory)
       (list :directory directory :path path))))
 
-(defun kubel--namespace-cache-key ()
-  "Identify namespace execution settings independently of local working folders.
+(defun kubel--completion-cache-key ()
+  "Identify completion execution settings independently of local working folders.
 Resolve relative kubeconfig and executable paths lexically.  Remote keys
 include the TRAMP connection identity without opening a connection."
   (let* ((remote (file-remote-p default-directory))
@@ -1171,7 +1161,11 @@ include the TRAMP connection identity without opening a connection."
          (executable (if (string-match-p "[/\\\\]" kubel-kubectl)
                          (kubel--namespace-normalize-path kubel-kubectl directory)
                        kubel-kubectl)))
-    (list kubel-context executable configs remote kubel-use-namespace-list)))
+    (list kubel-context executable configs remote)))
+
+(defun kubel--namespace-cache-key ()
+  "Identify namespace completion settings, including its permission policy."
+  (append (kubel--completion-cache-key) (list kubel-use-namespace-list)))
 
 (defun kubel--namespace-entry ()
   "Return or create the namespace completion entry for this session."
@@ -1180,11 +1174,13 @@ include the TRAMP connection identity without opening a connection."
     (or entry
         (puthash key (kubel--make-namespace-entry) kubel--namespace-cache))))
 
+(defun kubel--cache-fresh-p (timestamp ttl)
+  "Return non-nil if TIMESTAMP is fresh according to TTL seconds."
+  (and timestamp (or (null ttl) (< (- (float-time) timestamp) ttl))))
+
 (defun kubel--namespace-fresh-p (timestamp)
   "Return non-nil if TIMESTAMP is within the namespace cache TTL."
-  (and timestamp
-       (or (null kubel-namespace-cache-ttl)
-           (< (- (float-time) timestamp) kubel-namespace-cache-ttl))))
+  (kubel--cache-fresh-p timestamp kubel-namespace-cache-ttl))
 
 (defun kubel--namespace-candidates ()
   "Return cached names plus history and defaults without contacting Kubernetes."
@@ -1197,31 +1193,29 @@ include the TRAMP connection identity without opening a connection."
              (unless (string-empty-p kubel-namespace) (list kubel-namespace))
              (list kubel-default-namespace)))))
 
-(defun kubel--namespace-exec (entry command origin callback)
-  "Run COMMAND independently of resource refreshes for ENTRY.
-Show activity in ORIGIN and call CALLBACK with exit status, stdout and stderr.
+(defun kubel--completion-exec (command origin label callback)
+  "Run completion COMMAND independently of resource-table refreshes.
+Show activity LABEL in ORIGIN; pass exit status, stdout and stderr to CALLBACK.
 Execution uses the current `default-directory' and `process-environment'."
-  (let ((stdout (generate-new-buffer " *kubel-namespaces*"))
-        (stderr (generate-new-buffer " *kubel-namespaces-stderr*")))
+  (let ((stdout (generate-new-buffer " *kubel-completion*"))
+        (stderr (generate-new-buffer " *kubel-completion-stderr*")))
     (condition-case err
         (let ((process
                (make-process
-                :name "kubel-namespaces" :buffer stdout :stderr stderr
+                :name "kubel-completion" :buffer stdout :stderr stderr
                 :command command :connection-type 'pipe :noquery t :file-handler t
                 :sentinel
                 (lambda (process _event)
                   (when (and (memq (process-status process) '(exit signal))
-                             (not (process-get process 'kubel-namespace-finished)))
-                    (process-put process 'kubel-namespace-finished t)
-                    (when (eq process (kubel--namespace-entry-process entry))
-                      (setf (kubel--namespace-entry-process entry) nil))
+                             (not (process-get process 'kubel-completion-finished)))
+                    (process-put process 'kubel-completion-finished t)
                     (let ((status (process-exit-status process))
                           (output (with-current-buffer stdout (buffer-string)))
                           (errors (with-current-buffer stderr (buffer-string))))
                       (unwind-protect
                           (progn
                             (kubel--append-to-process-buffer
-                             (format "[kubel-namespaces]\nexit-code: %s" status))
+                             (format "[kubel-completion]\nexit-code: %s" status))
                             (unless (string-empty-p (string-trim errors))
                               (kubel--append-to-process-buffer
                                (format "stderr: %s" (string-trim errors)))))
@@ -1230,22 +1224,29 @@ Execution uses the current `default-directory' and `process-environment'."
                         (kill-buffer stderr))
                       (funcall callback status output errors)))))))
           (unless (processp process)
-            (error "Asynchronous namespace requests are unavailable here"))
-          (setf (kubel--namespace-entry-process entry) process)
+            (error "Asynchronous completion requests are unavailable here"))
           (when (get-buffer-process stderr)
             (set-process-sentinel (get-buffer-process stderr) #'ignore)
             (set-process-query-on-exit-flag (get-buffer-process stderr) nil))
           (when (buffer-live-p origin)
             (with-current-buffer origin
-              (kubel--log-command "kubel-namespaces" command)))
-          (kubel--activity-start process (list origin) "Updating namespaces")
+              (kubel--log-command "kubel-completion" command)))
+          (kubel--activity-start process (list origin) label)
           process)
       (error
        (kill-buffer stdout)
        (kill-buffer stderr)
-       (setf (kubel--namespace-entry-process entry) nil)
        (funcall callback 'failed "" (error-message-string err))
        nil))))
+
+(defun kubel--namespace-exec (entry command origin callback)
+  "Run namespace COMMAND for ENTRY in ORIGIN, then call CALLBACK."
+  (setf (kubel--namespace-entry-process entry)
+        (kubel--completion-exec
+         command origin "Updating namespaces"
+         (lambda (status output errors)
+           (setf (kubel--namespace-entry-process entry) nil)
+           (funcall callback status output errors)))))
 
 (defun kubel--namespace-finish (entry &optional error-message)
   "Finish updating ENTRY and notify its waiting callers.
@@ -1468,28 +1469,141 @@ When viewing namespaces, select the namespace under point or the single mark."
       (switch-to-buffer (current-buffer))
       (kubel-refresh))))
 
-(defun kubel--fetch-api-resource-list ()
-  "Fetch the API resource list."
-  (split-string (kubel--exec-sync
-                 (format "%s --context %s api-resources -o name --no-headers=true" kubel-kubectl kubel-context)) "\n" t))
+(defcustom kubel-resource-cache-ttl 300
+  "Seconds API resource completion data stays fresh.
+Nil means cached results never expire; zero revalidates on every invocation."
+  :type '(choice (const :tag "Never expire" nil) (number :tag "Seconds"))
+  :group 'kubel)
+
+(defcustom kubel-resource-cache-retry-delay 30
+  "Seconds before retrying failed API resource discovery automatically.
+A prefix argument to `kubel-set-resource' bypasses this delay."
+  :type 'number
+  :group 'kubel)
+
+(defcustom kubel-resource-request-timeout "30s"
+  "Kubectl request timeout for background API resource discovery."
+  :type 'string
+  :group 'kubel)
+
+(cl-defstruct (kubel--resource-entry (:constructor kubel--make-resource-entry))
+  names fetched-at retry-after process callbacks)
+
+(defvar kubel--resource-cache (make-hash-table :test #'equal)
+  "API resource lists shared by sessions using the same execution configuration.")
+
+(defvar kubel-resource-history nil
+  "Previously chosen resource types, available before discovery completes.")
+
+(defvar-local kubel--resource-prompt-token nil
+  "Identity of the latest resource selection requested in this buffer.")
+
+(defun kubel--resource-entry ()
+  "Return or create this execution configuration's API resource cache entry."
+  (let* ((key (kubel--completion-cache-key))
+         (entry (gethash key kubel--resource-cache)))
+    (or entry (puthash key (kubel--make-resource-entry) kubel--resource-cache))))
+
+(defun kubel--resource-candidates ()
+  "Return cached resource names, history and defaults without issuing requests."
+  (delete-dups
+   (append (copy-sequence (kubel--resource-entry-names (kubel--resource-entry)))
+           (copy-sequence kubel-resource-history)
+           (list kubel-resource "pods"))))
+
+(defun kubel--refresh-resource-cache (&optional force callback)
+  "Revalidate this configuration's API resource list asynchronously.
+FORCE bypasses freshness and retry delays.  CALLBACK runs after completion,
+including failures.  Concurrent callers share one pending request."
+  (let ((entry (kubel--resource-entry)))
+    (cond
+     ((processp (kubel--resource-entry-process entry))
+      (when callback (push callback (kubel--resource-entry-callbacks entry))))
+     ((and (not force)
+           (or (kubel--cache-fresh-p (kubel--resource-entry-fetched-at entry)
+                                     kubel-resource-cache-ttl)
+               (and (kubel--resource-entry-retry-after entry)
+                    (< (float-time) (kubel--resource-entry-retry-after entry)))))
+      (when callback (funcall callback)))
+     (t
+      (when callback (push callback (kubel--resource-entry-callbacks entry)))
+      (let ((retry-delay kubel-resource-cache-retry-delay))
+        (setf (kubel--resource-entry-process entry)
+              (kubel--completion-exec
+               (append (list kubel-kubectl)
+                       (when (and kubel-context (not (string-empty-p kubel-context)))
+                         (list "--context" kubel-context))
+                       (list (concat "--request-timeout=" kubel-resource-request-timeout)
+                             "api-resources" "-o" "name" "--no-headers=true"))
+               (current-buffer) "Updating resource types"
+               (lambda (status output errors)
+                 (setf (kubel--resource-entry-process entry) nil)
+                 (if (equal status 0)
+                     (setf (kubel--resource-entry-names entry)
+                           (sort (delete-dups (split-string output "[ \t\r\n]+" t)) #'string-lessp)
+                           (kubel--resource-entry-fetched-at entry) (float-time)
+                           (kubel--resource-entry-retry-after entry) nil)
+                   (setf (kubel--resource-entry-retry-after entry)
+                         (+ (float-time) retry-delay))
+                   (kubel--append-to-process-buffer
+                    (format "API resource discovery failed: %s" (string-trim errors)))
+                   (message "Kubel resource discovery failed; using cached resource types or history"))
+                 (let ((callbacks (kubel--resource-entry-callbacks entry)))
+                   (setf (kubel--resource-entry-callbacks entry) nil)
+                   (dolist (callback callbacks)
+                     (run-at-time 0 nil callback)))))))))))
+
+(defun kubel--kubernetes-resources-list ()
+  "Return cached resource candidates and revalidate asynchronously."
+  (prog1 (kubel--resource-candidates)
+    (kubel--refresh-resource-cache)))
+
+(defun kubel--open-resource (resource)
+  "Open a cloned resource session for RESOURCE."
+  (let ((parent-buffer (current-buffer))
+        (directory default-directory))
+    (with-current-buffer (clone-buffer)
+      (setq kubel--parent-buffer parent-buffer
+            kubel-resource resource
+            kubel--selected-items nil)
+      (cl-pushnew resource kubel-resource-history :test #'equal)
+      (switch-to-buffer (current-buffer))
+      (kubel-refresh directory))))
+
+(defun kubel--prompt-resource (candidates)
+  "Prompt using CANDIDATES and open the chosen resource view."
+  (kubel--open-resource
+   (completing-read "Select resource: " candidates nil nil nil
+                    'kubel-resource-history kubel-resource)))
+
+(defun kubel--resource-prompt-ready (origin key token)
+  "Prompt in ORIGIN if its execution KEY and pending selection TOKEN still match."
+  (when (and (buffer-live-p origin)
+             (with-current-buffer origin
+               (and (derived-mode-p 'kubel-mode)
+                    (eq token kubel--resource-prompt-token)
+                    (equal key (kubel--completion-cache-key)))))
+    (if (active-minibuffer-window)
+        (run-at-time 0.1 nil #'kubel--resource-prompt-ready origin key token)
+      (pop-to-buffer-same-window origin)
+      (setq kubel--resource-prompt-token nil)
+      (kubel--prompt-resource (kubel--resource-candidates)))))
 
 (defun kubel-set-resource (&optional refresh)
-  "Set the resource.
-If called with a prefix argument REFRESH, refreshes
-the context caches, including the cached resource list."
+  "Choose a resource type from cached candidates immediately.
+Expired or missing discovery data refreshes asynchronously.  With prefix
+argument REFRESH, fetch fresh candidates before prompting.  On failure retain
+cached names or history.  Namespace and label caches are unaffected."
   (interactive "P")
-  (when refresh (kubel--invalidate-context-caches))
-  (let* ((current-buffer-name (kubel--buffer-name))
-         (resource-list (kubel--kubernetes-resources-list))
-         (kubel--buffer (get-buffer current-buffer-name))
-         (parent-buffer (current-buffer))
-         (last-default-directory (when kubel--buffer (with-current-buffer kubel--buffer default-directory))))
-    (with-current-buffer (clone-buffer)
-      (setq kubel--parent-buffer parent-buffer)
-      (setq kubel-resource
-            (completing-read "Select resource: " resource-list))
-      (switch-to-buffer (current-buffer))
-      (kubel-refresh last-default-directory))))
+  (setq kubel--resource-prompt-token nil)
+  (if refresh
+      (let ((origin (current-buffer))
+            (key (kubel--completion-cache-key))
+            (token (list 'resource-prompt)))
+        (setq kubel--resource-prompt-token token)
+        (kubel--refresh-resource-cache
+         t (lambda () (kubel--resource-prompt-ready origin key token))))
+    (kubel--prompt-resource (kubel--kubernetes-resources-list))))
 
 (defun kubel-set-output-format ()
   "Set output format of kubectl."
@@ -2011,7 +2125,8 @@ to finish first."
   "Give cloned sessions independent process and timer state."
   (when (eq header-line-format kubel--activity-header-line)
     (setq header-line-format kubel--activity-saved-header))
-  (setq kubel--namespace-prompt-token nil
+  (setq kubel--resource-prompt-token nil
+        kubel--namespace-prompt-token nil
         kubel--activity-saved-header nil
         kubel--refresh-process nil
         kubel--activity-processes nil
