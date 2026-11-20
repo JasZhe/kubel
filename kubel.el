@@ -1141,10 +1141,37 @@ A prefix argument to `kubel-set-namespace' bypasses this delay."
 (defvar-local kubel--namespace-prompt-token nil
   "Identity of the latest namespace selection requested in this buffer.")
 
+(defun kubel--namespace-normalize-path (path directory)
+  "Normalize PATH against DIRECTORY without accessing the filesystem.
+DIRECTORY is local, or the local part of a TRAMP directory.  Preserve a
+relative remote directory when its absolute location is not yet known."
+  (if (and (file-name-absolute-p path) (not (string-prefix-p "~" path)))
+      (expand-file-name path "/")
+    (if (and (file-name-absolute-p directory)
+             (not (string-prefix-p "~" directory)))
+        ;; KUBECONFIG is a literal path list: kubectl does not expand tildes.
+        (expand-file-name (concat "./" path) directory)
+      (list :directory directory :path path))))
+
 (defun kubel--namespace-cache-key ()
-  "Identify this session's namespace execution configuration."
-  (list kubel-context kubel-kubectl (getenv "KUBECONFIG")
-        default-directory kubel-use-namespace-list))
+  "Identify namespace execution settings independently of local working folders.
+Resolve relative kubeconfig and executable paths lexically.  Remote keys
+include the TRAMP connection identity without opening a connection."
+  (let* ((remote (file-remote-p default-directory))
+         (directory (if remote (file-remote-p default-directory 'localname)
+                      default-directory))
+         (config (getenv "KUBECONFIG"))
+         (configs
+          (if (and config (not (string-empty-p config)))
+              (delete-dups
+               (mapcar (lambda (path) (kubel--namespace-normalize-path path directory))
+                       (split-string config (regexp-quote (if remote ":" path-separator)) t)))
+            (list (if remote :default-kubeconfig
+                    (expand-file-name ".kube/config" (expand-file-name "~/" "/"))))))
+         (executable (if (string-match-p "[/\\\\]" kubel-kubectl)
+                         (kubel--namespace-normalize-path kubel-kubectl directory)
+                       kubel-kubectl)))
+    (list kubel-context executable configs remote kubel-use-namespace-list)))
 
 (defun kubel--namespace-entry ()
   "Return or create the namespace completion entry for this session."

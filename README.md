@@ -104,9 +104,11 @@ refreshes namespace data only, leaving resource and label caches intact.
 When viewing the namespace resource list, `n` still selects the current row or
 single marked namespace directly.
 
-Namespace caches are shared by sessions using the same context, kubeconfig,
-kubectl executable, execution directory (including TRAMP), and namespace-list
-policy. Namespace fetching is independent of resource auto-refresh and does not
+Namespace caches are shared by sessions using the same context, normalized
+kubeconfig paths, kubectl executable, and namespace-list policy. Local working
+directories do not split the cache; relative kubeconfig and executable paths are
+resolved before comparing keys. Remote sessions are isolated by their TRAMP
+connection identity, without opening a connection to compute the key. Namespace fetching is independent of resource auto-refresh and does not
 run a permanent polling timer. Completion lists already open are not changed.
 See the [customize section](#Customize) for TTL and permission settings.
 
